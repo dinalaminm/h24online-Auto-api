@@ -1,0 +1,12 @@
+{
+  "name": "h24online-autocall-server",
+  "version": "1.0.0",
+  "description": "H24ONLINE Auto Call Server — Render.com free hosting",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "18"
+  }
+}
