@@ -3,6 +3,11 @@ const https = require("https");
 // ===== Firebase Config =====
 const FIREBASE_URL = "https://test-only-12cb4-default-rtdb.firebaseio.com";
 
+// ===== Timing Config (live.html এর সাথে মিলিয়ে রাখুন) =====
+const NEXT_ROUND_DELAY   = 10 * 60 * 1000;  // 10 মিনিট — live.html এর মতোই
+const CHECK_INTERVAL_MS  = 15 * 1000;        // প্রতি ১৫ সেকেন্ডে auto call চেক
+const ROUND_CHECK_MS     = 30 * 1000;        // প্রতি ৩০ সেকেন্ডে round চেক (round শুরু দ্রুত হবে)
+
 // ===== Firebase REST API helpers =====
 function firebaseGet(path) {
     return new Promise((resolve, reject) => {
@@ -33,7 +38,31 @@ function firebaseSet(path, value) {
         const req = https.request(options, res => {
             let data = "";
             res.on("data", chunk => data += chunk);
-            res.on("end", () => resolve(JSON.parse(data)));
+            res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { resolve(null); } });
+        });
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+    });
+}
+
+function firebasePatch(path, value) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(value);
+        const url  = new URL(`${FIREBASE_URL}/${path}.json`);
+        const options = {
+            hostname: url.hostname,
+            path:     url.pathname + url.search,
+            method:   "PATCH",
+            headers:  {
+                "Content-Type":   "application/json",
+                "Content-Length": Buffer.byteLength(body),
+            },
+        };
+        const req = https.request(options, res => {
+            let data = "";
+            res.on("data", chunk => data += chunk);
+            res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { resolve(null); } });
         });
         req.on("error", reject);
         req.write(body);
@@ -46,44 +75,223 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ===== WINNER DETECTION (live.html এর মতো একই algorithm) =====
+
+function seededRand(seed) {
+    let s = seed;
+    return () => {
+        s = (s * 1664525 + 1013904223) & 0xffffffff;
+        return (s >>> 0) / 0xffffffff;
+    };
+}
+
+function generateSet(setNo) {
+    const rand = seededRand(setNo * 999983 + 7);
+    const colPools = [
+        [1,2,3,4,5,6,7,8,9],
+        [10,11,12,13,14,15,16,17,18,19],
+        [20,21,22,23,24,25,26,27,28,29],
+        [30,31,32,33,34,35,36,37,38,39],
+        [40,41,42,43,44,45,46,47,48,49],
+        [50,51,52,53,54,55,56,57,58,59],
+        [60,61,62,63,64,65,66,67,68,69],
+        [70,71,72,73,74,75,76,77,78,79],
+        [80,81,82,83,84,85,86,87,88,89,90]
+    ];
+    const shuffled = colPools.map(pool => {
+        const arr = [...pool];
+        for (let i = arr.length - 1; i > 0; i--) {
+            const j = Math.floor(rand() * (i + 1));
+            [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr;
+    });
+    const tickets = Array.from({ length: 6 }, () => ({
+        grid: Array.from({ length: 3 }, () => Array(9).fill(null)),
+        nums: []
+    }));
+    const matrix = generateMatrix(rand, shuffled.map(p => p.length));
+    const ptrs   = Array(9).fill(0);
+    for (let r = 0; r < 18; r++) {
+        const ti = Math.floor(r / 3);
+        const ri = r % 3;
+        for (let c = 0; c < 9; c++) {
+            if (matrix[r][c]) {
+                const n = shuffled[c][ptrs[c]++];
+                tickets[ti].grid[ri][c] = n;
+                tickets[ti].nums.push(n);
+            }
+        }
+    }
+    return tickets;
+}
+
+function generateMatrix(rand, colCounts) {
+    const mat = Array.from({ length: 18 }, () => Array(9).fill(false));
+    const rem = [...colCounts];
+    for (let r = 0; r < 18; r++) {
+        const rowsLeft = 18 - r;
+        const chosen   = [];
+        const cols     = Array.from({ length: 9 }, (_, i) => i);
+        for (let i = cols.length - 1; i > 0; i--) {
+            const j = Math.floor(rand() * (i + 1));
+            [cols[i], cols[j]] = [cols[j], cols[i]];
+        }
+        for (const c of cols) {
+            if (rem[c] >= rowsLeft && !chosen.includes(c)) chosen.push(c);
+        }
+        const rest = cols.filter(c => !chosen.includes(c) && rem[c] > 0);
+        for (let i = rest.length - 1; i > 0; i--) {
+            const j = Math.floor(rand() * (i + 1));
+            [rest[i], rest[j]] = [rest[j], rest[i]];
+        }
+        for (const c of rest) {
+            if (chosen.length >= 5) break;
+            if (rem[c] > 0) chosen.push(c);
+        }
+        for (let i = 0; i < Math.min(5, chosen.length); i++) {
+            mat[r][chosen[i]] = true;
+            rem[chosen[i]]--;
+        }
+    }
+    return mat;
+}
+
+// 100 সেট cache
+let allSetsCache = null;
+function getAllSets() {
+    if (allSetsCache) return allSetsCache;
+    allSetsCache = [];
+    for (let s = 1; s <= 100; s++) allSetsCache.push(generateSet(s));
+    return allSetsCache;
+}
+
+function getTNO(setNo, ti)  { return (setNo - 1) * 6 + ti + 1; }
+function getSeat(setNo)     { return `N${String(setNo).padStart(3, '0')}`; }
+
+// Prize check functions
+const PRIZE_CHECKS = {
+    earlyfive: (nums, grid, cs) => nums.filter(n => cs.has(n)).length >= 5,
+    quick7:    (nums, grid, cs) => nums.filter(n => cs.has(n)).length >= 7,
+    topline:   (nums, grid, cs) => {
+        const top = grid[0].filter(n => n !== null);
+        return top.length === 5 && top.every(n => cs.has(n));
+    },
+    middleline: (nums, grid, cs) => {
+        const mid = grid[1].filter(n => n !== null);
+        return mid.length === 5 && mid.every(n => cs.has(n));
+    },
+    bottomline: (nums, grid, cs) => {
+        const bot = grid[2].filter(n => n !== null);
+        return bot.length === 5 && bot.every(n => cs.has(n));
+    },
+    corner: (nums, grid, cs) => {
+        let tL = null, tR = null, bL = null, bR = null;
+        for (let c = 0; c < 9; c++) {
+            const v = grid[0][c];
+            if (v !== null) { if (tL === null) tL = v; tR = v; }
+        }
+        for (let c = 0; c < 9; c++) {
+            const v = grid[2][c];
+            if (v !== null) { if (bL === null) bL = v; bR = v; }
+        }
+        if (tL === null || bL === null) return false;
+        const corners = [...new Set([tL, tR, bL, bR])];
+        return corners.length === 4 && corners.every(n => cs.has(n));
+    },
+    fullhouse: (nums, grid, cs) => nums.length === 15 && nums.every(n => cs.has(n)),
+};
+
+function detectWinners(called, existingWinners) {
+    const cs  = new Set(called.map(Number));
+    const sets = getAllSets();
+    const newWinners = {};
+
+    for (const [prizeKey, checkFn] of Object.entries(PRIZE_CHECKS)) {
+        if (existingWinners && existingWinners[prizeKey]) continue; // already won
+
+        for (let s = 0; s < 100; s++) {
+            let found = false;
+            for (let ti = 0; ti < 6; ti++) {
+                const tk = sets[s][ti];
+                if (checkFn(tk.nums, tk.grid, cs)) {
+                    newWinners[prizeKey] = {
+                        tno:      getTNO(s + 1, ti),
+                        seat:     getSeat(s + 1),
+                        calledAt: called.length,
+                        time:     new Date().toLocaleTimeString('bn-BD')
+                    };
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+    }
+
+    return newWinners;
+}
+
 // ===== AUTO CALL LOGIC =====
 async function runAutoCall() {
     try {
         const d = await firebaseGet("game");
-        if (!d)              { console.log("⚠️  Firebase data নেই"); return; }
-        if (!d.autoMode)     { console.log("⏸  Auto Mode OFF — কিছু করছি না"); return; }
+        if (!d)           { console.log("⚠️  Firebase data নেই"); return; }
+        if (!d.autoMode)  { console.log("⏸  Auto Mode OFF"); return; }
         if (d.status === "ROUND ENDED") { console.log("🏁 Round শেষ — skip"); return; }
+        if (d.status !== "GAME IS LIVE") { console.log(`⏳ Status: ${d.status} — skip`); return; }
 
-        const pool    = Array.isArray(d.numberPool)    ? d.numberPool    : [];
-        const called  = Array.isArray(d.calledNumbers) ? d.calledNumbers : [];
-        const speed   = (d.autoCallSpeed > 0 ? d.autoCallSpeed : 15); // seconds
+        const pool   = Array.isArray(d.numberPool)    ? d.numberPool    : [];
+        const called = Array.isArray(d.calledNumbers) ? d.calledNumbers : [];
+        const speed  = d.autoCallSpeed > 0 ? d.autoCallSpeed : 15;
 
+        // pool-এর ক্রম অনুযায়ী পরবর্তী number বের করো (random নয়)
         const remaining = pool.filter(n => !called.includes(n));
 
         if (remaining.length === 0) {
-            await firebaseSet("game/status", "ROUND ENDED");
-            console.log("✅ সব নাম্বার শেষ — ROUND ENDED set করা হয়েছে");
+            // সব number শেষ — round end করো
+            const endNow = Date.now();
+            await firebasePatch("game", {
+                status:       "ROUND ENDED",
+                roundEndTime: endNow,
+                nextRoundAt:  endNow + NEXT_ROUND_DELAY
+            });
+            console.log("✅ সব নম্বর শেষ — ROUND ENDED");
             return;
         }
 
-        // এই cycle-এ কতটা call করবো
-        const callsThisCycle = Math.max(1, Math.floor(CHECK_INTERVAL_MS / (speed * 1000)));
-        const toCall = Math.min(callsThisCycle, remaining.length);
+        // Pool-এর ক্রম অনুযায়ী প্রথম number নাও
+        const pick = remaining[0];
+        const newCalled = [...called, pick];
 
-        let currentCalled = [...called];
+        await firebaseSet("game/calledNumbers", newCalled);
+        console.log(`🎱 Called: ${pick}  (${newCalled.length}/90, বাকি: ${remaining.length - 1})`);
 
-        for (let i = 0; i < toCall; i++) {
-            const stillRemaining = pool.filter(n => !currentCalled.includes(n));
-            if (stillRemaining.length === 0) break;
+        // ── Winner Detection ──
+        const existingWinners = d.winners || {};
+        const newWinners = detectWinners(newCalled, existingWinners);
 
-            const pick = stillRemaining[Math.floor(Math.random() * stillRemaining.length)];
-            currentCalled.push(pick);
+        if (Object.keys(newWinners).length > 0) {
+            const winUpdates = {};
+            for (const [key, val] of Object.entries(newWinners)) {
+                winUpdates[`game/winners/${key}`] = val;
+                console.log(`🏆 Winner: ${key} → TNO:${val.tno} সীট-${val.seat} (${val.calledAt} নম্বরে)`);
+            }
+            // Winners Firebase-এ লেখো
+            for (const [path, val] of Object.entries(winUpdates)) {
+                await firebaseSet(path, val);
+            }
 
-            await firebaseSet("game/calledNumbers", currentCalled);
-            console.log(`🎱 Auto called: ${pick}  (${currentCalled.length}/90 called, ${90 - currentCalled.length} বাকি)`);
-
-            // পরের call-এর আগে speed-অনুযায়ী wait করো
-            if (i < toCall - 1) await sleep(speed * 1000);
+            // Full House হলে Round শেষ করো
+            if (newWinners.fullhouse || existingWinners.fullhouse) {
+                const endNow = Date.now();
+                await firebasePatch("game", {
+                    status:       "ROUND ENDED",
+                    roundEndTime: endNow,
+                    nextRoundAt:  endNow + NEXT_ROUND_DELAY
+                });
+                console.log(`🎮 Full House! ROUND ENDED — পরবর্তী রাউন্ড ${NEXT_ROUND_DELAY / 60000} মিনিট পরে`);
+            }
         }
 
     } catch (err) {
@@ -97,16 +305,24 @@ async function runAutoRound() {
         const d = await firebaseGet("game");
         if (!d || !d.autoMode) return;
 
-        // রাউন্ড চলমান থাকলে নতুন শুরু করবো না
+        // রাউন্ড এখনো LIVE → শুরু করবো না
         if (d.status === "GAME IS LIVE") {
-            const called = Array.isArray(d.calledNumbers) ? d.calledNumbers : [];
-            if (called.length < 90) {
-                console.log("🔄 Round এখনো চলছে — নতুন শুরু করছি না");
+            console.log("🔄 Round এখনো চলছে — skip");
+            return;
+        }
+
+        // ROUND ENDED — nextRoundAt পেরিয়ে গেলে নতুন round শুরু করো
+        if (d.status === "ROUND ENDED") {
+            const nextRoundAt = d.nextRoundAt || 0;
+            const now         = Date.now();
+            if (nextRoundAt > 0 && now < nextRoundAt) {
+                const waitSec = Math.round((nextRoundAt - now) / 1000);
+                console.log(`⏳ পরবর্তী রাউন্ড ${waitSec}s পরে`);
                 return;
             }
         }
 
-        // Pool shuffle
+        // নতুন round শুরু
         const pool = [];
         for (let i = 1; i <= 90; i++) pool.push(i);
         for (let i = pool.length - 1; i > 0; i--) {
@@ -115,41 +331,46 @@ async function runAutoRound() {
         }
 
         const newRound = (d.roundNum || 0) + 1;
+        const now      = Date.now();
+
         await firebaseSet("game", {
             calledNumbers:  [],
             winners:        {},
             roundNum:       newRound,
-            roundStartTime: Date.now(),
+            roundStartTime: now,
             numberPool:     pool,
             status:         "GAME IS LIVE",
             autoMode:       true,
             autoCallSpeed:  d.autoCallSpeed || 15,
+            roundEndTime:   0,
+            nextRoundAt:    0
         });
 
+        // Cache reset করো — নতুন round এ নতুন করে detect হবে
         console.log(`🚀 AUTO Round #${newRound} শুরু হয়েছে!`);
+
     } catch (err) {
         console.error("❌ autoRound error:", err.message);
     }
 }
 
 // ===== INTERVALS =====
-const CHECK_INTERVAL_MS = 15 * 1000;   // প্রতি ১৫ সেকেন্ডে auto call চেক
-const ROUND_INTERVAL_MS = 20 * 60 * 1000; // প্রতি ২০ মিনিটে round চেক
-
 console.log("🤖 H24ONLINE Auto-Call Server চালু হয়েছে!");
-console.log(`⏱  Call check: প্রতি ${CHECK_INTERVAL_MS/1000}s`);
-console.log(`🔄 Round check: প্রতি ${ROUND_INTERVAL_MS/60000} মিনিট`);
+console.log(`⏱  Call check: প্রতি ${CHECK_INTERVAL_MS / 1000}s`);
+console.log(`🔄 Round check: প্রতি ${ROUND_CHECK_MS / 1000}s`);
+console.log(`⏰ Next round delay: ${NEXT_ROUND_DELAY / 60000} মিনিট`);
 
 // প্রথমবার সাথে সাথে চালাও
 runAutoCall();
+runAutoRound();
 
 setInterval(runAutoCall,  CHECK_INTERVAL_MS);
-setInterval(runAutoRound, ROUND_INTERVAL_MS);
+setInterval(runAutoRound, ROUND_CHECK_MS);
 
 // ===== HTTP SERVER (Render.com জীবিত রাখার জন্য) =====
 const http = require("http");
 http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("H24ONLINE Auto-Call Server is running ✅");
 }).listen(process.env.PORT || 3000, () => {
     console.log(`🌐 HTTP server চালু — port ${process.env.PORT || 3000}`);
