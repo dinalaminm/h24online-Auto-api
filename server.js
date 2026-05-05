@@ -2,6 +2,66 @@ const https = require("https");
 
 // ===== Firebase Config =====
 const FIREBASE_URL = "https://test-only-12cb4-default-rtdb.firebaseio.com";
+const FIRESTORE_ROUNDS_URL = "https://firestore.googleapis.com/v1/projects/h24-online/databases/(default)/documents/settings/rounds";
+
+// ===== Firestore থেকে rounds list লোড করো =====
+let _roundsListCache = null;
+async function loadRoundsList() {
+    if (_roundsListCache) return _roundsListCache;
+    try {
+        const res = await new Promise((resolve, reject) => {
+            https.get(FIRESTORE_ROUNDS_URL, r => {
+                let data = "";
+                r.on("data", c => data += c);
+                r.on("end", () => resolve(JSON.parse(data)));
+            }).on("error", reject);
+        });
+        const listArr = res.fields?.list?.arrayValue?.values || [];
+        _roundsListCache = listArr.map(v => {
+            const m = v.mapValue?.fields || {};
+            return {
+                label: m.label?.stringValue || '',
+                time:  m.time?.stringValue  || ''
+            };
+        });
+        console.log(`📋 Rounds loaded: ${_roundsListCache.length}টি`);
+        return _roundsListCache;
+    } catch(e) {
+        console.warn("⚠️ Rounds load failed:", e.message);
+        return [];
+    }
+}
+
+function parseRoundTime(str) {
+    if (!str) return null;
+    const p = str.trim().split(" ");
+    if (p.length < 2) return null;
+    const [hh, mm] = p[0].split(":");
+    const mer = p[1].toUpperCase();
+    let h = parseInt(hh)||0, m = parseInt(mm)||0;
+    if (mer === "PM" && h !== 12) h += 12;
+    if (mer === "AM" && h === 12) h = 0;
+    return {h, m};
+}
+
+async function getAutoRoundLabel() {
+    const rounds = await loadRoundsList();
+    if (!rounds.length) return "";
+    const now = new Date();
+    const nowMin = now.getHours()*60 + now.getMinutes();
+    for (let i = 0; i < rounds.length; i++) {
+        const r = rounds[i];
+        let p = parseRoundTime(r.time || "");
+        if (!p && r.label) {
+            const parts = r.label.split(" - ");
+            p = parseRoundTime((parts[1]||"").trim());
+        }
+        if (!p) continue;
+        const rm = (p.h===0 && p.m===0) ? 1440 : p.h*60+p.m;
+        if (nowMin < rm) return r.label;
+    }
+    return rounds[rounds.length-1]?.label || "";
+}
 
 // ===== Timing Config (live.html এর সাথে মিলিয়ে রাখুন) =====
 const NEXT_ROUND_DELAY   = 10 * 60 * 1000;  // 10 মিনিট — live.html এর মতোই
@@ -333,10 +393,15 @@ async function runAutoRound() {
         const newRound = (d.roundNum || 0) + 1;
         const now      = Date.now();
 
+        // সময় অনুযায়ী roundLabel বের করো
+        const roundLabel = await getAutoRoundLabel();
+        console.log(`🏷️  Round Label: ${roundLabel || "(পাওয়া যায়নি)"}`);
+
         await firebaseSet("game", {
             calledNumbers:  [],
             winners:        {},
             roundNum:       newRound,
+            roundLabel:     roundLabel,
             roundStartTime: now,
             numberPool:     pool,
             status:         "GAME IS LIVE",
@@ -347,7 +412,7 @@ async function runAutoRound() {
         });
 
         // Cache reset করো — নতুন round এ নতুন করে detect হবে
-        console.log(`🚀 AUTO Round #${newRound} শুরু হয়েছে!`);
+        console.log(`🚀 AUTO Round #${newRound} "${roundLabel}" শুরু হয়েছে!`);
 
     } catch (err) {
         console.error("❌ autoRound error:", err.message);
